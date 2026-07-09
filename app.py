@@ -1,7 +1,10 @@
 import streamlit as st
+import cv2
 import tflite_runtime.interpreter as tflite
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import numpy as np
-from PIL import Image
+import av
+
 
 
 # 1. Konfigurasi Halaman
@@ -17,61 +20,81 @@ st.write("Unggah foto wajah Anda untuk mendeteksi penggunaan masker.")
 
 
 # 2. Load Model TFLite (Menggunakan cache agar efisien)
+
 @st.cache_resource
-def load_tflite_model():
-    interpreter = tflite.Interpreter(model_path="model_masker_jay.tflite")
+def load_models():
+    interpreter = tflite.Interpreter(model_path="model_masker.tflite")
     interpreter.allocate_tensors()
-    return interpreter
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    return interpreter, face_cascade
+
+interpreter, face_cascade = load_models()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
 
-try:
-    interpreter = load_tflite_model()
-    st.success("Model TFLite Ringan Berhasil Dimuat!")
-   
-    # Ambil informasi detail input & output tensor
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-except Exception as e:
-    st.error(f"Gagal memuat model 'model_masker.tflite'. Error: {e}")
+# 3. Struktur Baru: Menggunakan VideoProcessorBase dan recv()
+class FaceMaskProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.interpreter = interpreter
+        self.face_cascade = face_cascade
+        self.input_details = input_details
+        self.output_details = output_details
 
+    def recv(self, frame):
+        # 1. Konversi frame PyAV ke format NumPy image (BGR untuk OpenCV)
+        img = frame.to_ndarray(format="bgr24")
+        
+        # 2. Deteksi wajah menggunakan Grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        
+        for (x, y, w, h) in faces:
+            try:
+                # Potong area wajah (ROI)
+                roi_color = img[y:y+h, x:x+w]
+                
+                # Preprocessing: Resize ke 120x120 & konversi ke RGB
+                roi_rgb = cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB)
+                img_resized = cv2.resize(roi_rgb, (120, 120))
+                
+                # Normalisasi (1./255) & Expand dimensi -> (1, 120, 120, 3)
+                img_array = np.array(img_resized, dtype=np.float32) / 255.0
+                img_batch = np.expand_dims(img_array, axis=0)
+                
+                # Jalankan Prediksi TFLite
+                self.interpreter.set_tensor(self.input_details[0]['index'], img_batch)
+                self.interpreter.invoke()
+                prediction = self.interpreter.get_tensor(self.output_details[0]['index'])[0][0]
+                
+                # Penentuan Label & Warna Kotak Pelacak
+                if prediction < 0.5:
+                    label = f"Bermasker: {(1 - prediction)*100:.1f}%"
+                    color = (0, 255, 0) # Hijau
+                else:
+                    label = f"Tanpa Masker: {prediction*100:.1f}%"
+                    color = (0, 0, 255) # Merah
+                
+                # Gambar bounding box dan teks di atas wajah
+                cv2.rectangle(img, (x, y), (x+w, y+h), color, 3)
+                cv2.putText(img, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+            except Exception:
+                pass
+                
+        # 3. Kembalikan array kembali dalam bentuk objek av.VideoFrame
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    
+# 4. Jalankan WebRTC Streamer dengan parameter baru
+st.subheader("Live Camera Feed")
+webrtc_streamer(
+    key="face-mask-detection-recv",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=FaceMaskProcessor, # Perubahan nama parameter dari video_transformer_factory
+    rtc_configuration={
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    },
+    media_stream_constraints={"video": True, "audio": False},
+)
 
-# 3. Fitur Upload Gambar
-uploaded_file = st.file_uploader("Pilih gambar...", type=["jpg", "jpeg", "png"])
-
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.image(image, caption='Gambar yang diunggah', use_column_width=True)
-   
-    st.write("Sedang menganalisis...")
-   
-    # 4. Preprocessing Gambar (120x120)
-    IMG_SIZE = (120, 120)
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-       
-    img_resized = image.resize(IMG_SIZE)
-    img_array = np.array(img_resized, dtype=np.float32)
-   
-    # Normalisasi skala 1./255
-    img_array = img_array / 255.0
-    img_batch = np.expand_dims(img_array, axis=0)
-   
-    # 5. Jalankan Inferensi TFLite
-    interpreter.set_tensor(input_details[0]['index'], img_batch)
-    interpreter.invoke()
-   
-    # Mengambil hasil prediksi mentah (output sigmoid)
-    prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
-   
-    # 6. Klasifikasi Hasil
-    st.subheader("Hasil Analisis:")
-    if prediction < 0.5:
-        confidence = (1 - prediction) * 100
-        st.success(f"✅ **Menggunakan Masker** (Tingkat Keyakinan: {confidence:.2f}%)")
-    else:
-        confidence = prediction * 100
-        st.error(f"❌ **Tidak Menggunakan Masker** (Tingkat Keyakinan: {confidence:.2f}%)")
-       
-    with st.expander("Lihat Detail Output Model"):
-        st.write(f"Nilai mentah aktivasi Sigmoid: {prediction:.4f}")
+st.info("💡 Aplikasi berjalan menggunakan PyAV engine yang memastikan performa tracking FPS jauh lebih lancar.")
